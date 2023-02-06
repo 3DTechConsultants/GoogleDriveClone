@@ -27,7 +27,7 @@ Usage:
 //Copy the root of the google drive. 
 const sourceFolderId = DriveApp.getRootFolder().getId();
 //ID of the destination folder. 
-const targetParentFolderId = '1dZY1c9SD-6XOPuQh81aCe3cNa5zJj3Xs';
+const targetParentFolderId = 'TARGETFOLDERIDHERE';
 //The temporary state file - it will be written to the root of the source folder. 
 const statefileFilename = 'driveClone.json';
 //The time our execution is over. 
