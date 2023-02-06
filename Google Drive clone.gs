@@ -16,7 +16,8 @@ Usage:
     The script writes out JSON data to statefileFilename in the root of the source folder. 
 2. Run runCloneJob
     The script reads the statefile and skips any files that have already been copied. 
-    It copies all remaining files and recreates their edit and viewer permissions. 
+    It copies all remaining folders and recreates their edit and viewer permissions. 
+    It copies any files inside each folder. 
     If the script runs longer than maxRuntime it creates a trigger to rerun the script after minToNextRun milliseconds and updates statefileFilename with the current state of the job. 
     If the script is completed successfully it emails the owner of the script and notifies them that the job is complete. 
 
