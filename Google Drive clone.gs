@@ -1,62 +1,81 @@
 /*
-Cloning from one google drive to another across organizations is REALLY hard. You can move files, but not folders. 
+Transferring from one google drive to another across organizations is REALLY hard. You can move files, but not folders. 
 There's no built in way to copy a whole directory tree from one drive to another. If you use Drive for Desktop you can't copy native google file formats (Docs, sheets, slides, ect.)
-
 This script attempts to do the following: 
 Copy all files & folders from one google drive folder to another
 Recreate sharing permissions on folders
 Handle situations where the clone job takes longer than the max runtime of scripts (6 min)
-
 Setup: 
 Modify targetParentFolderId to be the folder ID of the destination folder. Note, you need a FOLDER ID here not a shared drive ID. 
-
-Usage: 
-1. Run buildStatefile. 
-    The script traverses SourceFolder and logs all files and folders to the jsonFilename. This step in the process is not tolerant to running out of time. It must complete in a single run. 
-    The script writes out JSON data to statefileFilename in the root of the source folder. 
-2. Run runCloneJob
-    The script reads the statefile and skips any files that have already been copied. 
-    It copies all remaining folders and recreates their edit and viewer permissions. 
-    It copies any files inside each folder. 
-    If the script runs longer than maxRuntime it creates a trigger to rerun the script after minToNextRun milliseconds and updates statefileFilename with the current state of the job. 
-    If the script is completed successfully it emails the owner of the script and notifies them that the job is complete. 
-
+If you don't want to copy a whole google drive You can modify sourceFolderId to be the ID number of the folder you want to copy. 
+Usage:
+Run runCloneJob
+  The script traverses SourceFolder and writes all files and folders an object.
+    This step in the process is not tolerant to running out of time. The script can traverse VERY large trees in 6 minutes.
+  It traverses the object and copies files and folders.
+   If it runs up against the timeout limit it creates a trigger to rerun the script after minToNextRun milliseconds and updates statefileFilename with the current state of the job.
+   If the script is completed successfully it emails the owner of the script and notifies them that the job is complete.
+   The stateFileFilename stays intact and can be read with a text editor. It has statistics like job start, end, and total runtime.
 */
-
-
 //Copy the root of the google drive. 
 const sourceFolderId = DriveApp.getRootFolder().getId();
 //ID of the destination folder. 
-const targetParentFolderId = 'TARGETFOLDERIDHERE';
+const targetParentFolderId = 'TARGETPARENTFOLDERID';
 //The temporary state file - it will be written to the root of the source folder. 
 const statefileFilename = 'driveClone.json';
-//The time our execution is over. 
-var endTime;
 //Official max runtime is 6 minutes, although I've seen some scripts run up to 30 minutes. 
 const maxRuntime = 5 * 60 * 1000;
 //How long to wait to trigger another run of runCloneJob. 
 const minToNextRun = 1 * 60 * 1000;
+let cloneJob;
 //******************************************************************
-//Run this first to build the state file. We assume this process will take less than 6 minutes. 
-function buildStatefile() {
-  let driveTree = [];
+function runCloneJob() {
   let sourceFolder = DriveApp.getFolderById(sourceFolderId);
-  processDirectory_(sourceFolder, driveTree);
-  writeStateFile_(JSON.stringify(driveTree));
+  cloneJob = readStateFile_();
+  cloneJob.timeout = Date.now() + maxRuntime;
+  if (cloneJob.phase == 1) {
+    buildStatefile_(cloneJob.tree, sourceFolder);
+    cloneJob.phase = 2;
+  }
+  if (cloneJob.phase == 2) {
+    copyDir_(cloneJob.tree, targetParentFolderId);
+  }
+  //If we're past our end time, it means we didn't complete the whole copy job. So set a trigger to run runCloneJob again.
+  if (Date.now() >= cloneJob.timeout) {
+    //There are a finite number of triggers a script can have. We have to clear them before creating a new one. 
+    clearTriggers_();
+    Logger.log("Execution time exceeded - Creating trigger to run in " + minToNextRun + " ms")
+    ScriptApp.newTrigger("runCloneJob")
+      .timeBased()
+      .after(minToNextRun)
+      .create();
+  }
+  else {
+    //We're finished with the clone job, so clear any triggers and send an email.
+    cloneJob.end = Date.now();
+    cloneJob.phase = 3;
+    cloneJob.totalRuntime = (cloneJob.end - cloneJob.start) / 60000
+    clearTriggers_();
+    MailApp.sendEmail(Session.getActiveUser().getEmail(), "Drive clone complete", "The drive clone job has completed successfully\n\n" +
+      "\nFolders copied: " + cloneJob.folderCount +
+      "\nFiles copied: " + cloneJob.fileCount +
+      "\nFailures: " + cloneJob.failures +
+      "\nTotal Runtime: " + Math.round(cloneJob.totalRuntime) + " Minutes\n");
+  }
+  writeStateFile_(cloneJob);
 }
 //******************************************************************
-function processDirectory_(source, driveTree) {
+function buildStatefile_(driveTree, source) {
 
   let sourceName = source.getName();
   let sourceID = source.getId();
   let thisFolder = { type: "folder", name: sourceName, id: sourceID, destId: "", children: new Array(), editors: getEditorEmails_(source), viewers: getViewerEmails_(source) };
-  Logger.log("Working on folder " + sourceName + " ID: " + sourceID);
+  Logger.log("Entering folder " + sourceName + " ID: " + sourceID);
 
   let folders = source.getFolders();
-  Logger.log("\tGetting subfolders of " + sourceName + " ID: " + sourceID);
   while (folders.hasNext()) {
     let subFolder = folders.next();
-    processDirectory_(subFolder, thisFolder.children);
+    buildStatefile_(thisFolder.children, subFolder);
   }
 
   let files = source.getFiles();
@@ -70,7 +89,7 @@ function processDirectory_(source, driveTree) {
 //******************************************************************
 function clearTriggers_() {
   let triggers = ScriptApp.getProjectTriggers();
-  for(let i=0;i<triggers.length;i++) {
+  for (let i = 0; i < triggers.length; i++) {
     ScriptApp.deleteTrigger(triggers[i]);
     Utilities.sleep(1000);
   }
@@ -82,60 +101,42 @@ function writeStateFile_(content) {
   if (fileList.hasNext()) {
     // State file exists - replace content
     var file = fileList.next();
-    file.setContent(content);
+    file.setContent(JSON.stringify(content));
   }
   else {
     // state file doesn't exist. Create it. 
-    destFolder.createFile(statefileFilename, content);
+    destFolder.createFile(statefileFilename, JSON.stringify(content));
   }
 }
 //******************************************************************
 function readStateFile_() {
   let destFolder = DriveApp.getFolderById(sourceFolderId);
   let fileList = destFolder.getFilesByName(statefileFilename);
+  let rv = null;
   if (fileList.hasNext()) {
-    // State file exists - replace content
     var file = fileList.next();
-    return file.getBlob()
-      .getDataAsString();
+    rv = JSON.parse(file.getBlob().getDataAsString());
   }
   else {
-    return null;
+    rv = {
+      start: Date.now(),
+      timeout: Date.now() + maxRuntime,
+      phase: 1,
+      end: 0,
+      totalRuntime: 0,
+      fileCount: 0,
+      folderCount: 0,
+      failures: 0,
+      failureList: [],
+      tree: []
+    };
   }
+  return rv;
 }
 //******************************************************************
-function runCloneJob() {
-
-  let statefileContents = readStateFile_();
-  if(!statefileContents){
-    Logger.log("Can't read statefile - bailing out");
-    return;
-  }
-  var driveTree = JSON.parse(statefileContents);
-
-  endTime = Date.now() + maxRuntime;
-  cloneDir_(driveTree, targetParentFolderId);
-  //If we're past our end time, it means we didn't complete the whole copy job. So set a trigger to run runCloneJob again.
-  if (Date.now() >= endTime) {
-    //There are a finite number of triggers a script can have. We have to clear them before creating a new one. 
-    clearTriggers_();
-    Logger.log("Execution time exceeded - Creating trigger to run in " + minToNextRun + " ms")
-    ScriptApp.newTrigger("runCloneJob")
-      .timeBased()
-      .after(minToNextRun)
-      .create();
-  }
-  else {
-    //We're finished with the clone job, so clear any triggers and send an email.
-    clearTriggers_();
-    MailApp.sendEmail(Session.getActiveUser().getEmail(), "Drive clone complete", "The drive clone job has completed successfully")
-  }
-  writeStateFile_(JSON.stringify(driveTree));
-}
-//******************************************************************
-function cloneDir_(driveTree, parentFolder) {
+function copyDir_(driveTree, parentFolder) {
   for (let i = 0; i < driveTree.length; i++) {
-    if (Date.now() >= endTime) {
+    if (Date.now() >= cloneJob.timeout) {
       Logger.log("Timeout reached");
       return;
     }
@@ -145,6 +146,7 @@ function cloneDir_(driveTree, parentFolder) {
         Logger.log("Creating folder " + driveTree[i].name);
         let newFolder = DriveApp.getFolderById(parentFolder).createFolder(driveTree[i].name);
         driveTree[i].destId = newFolder.getId();
+        cloneJob.folderCount++;
         if (driveTree[i].editors && driveTree[i].editors.length > 0) {
           newFolder.addEditors(driveTree[i].editors);
         }
@@ -153,29 +155,31 @@ function cloneDir_(driveTree, parentFolder) {
         }
       }
       else {
-        Logger.log("Folder exists - Reusing " + driveTree[i].name)
+        Logger.log("Folder exists " + driveTree[i].name)
       }
     } else {
       if (!driveTree[i].destId) {
         Logger.log("Copying file " + driveTree[i].name);
         let sourceFile = DriveApp.getFileById(driveTree[i].id);
         let destFile;
-        //I've encountered some files that can't be copied. 
+        //Have to wrap the copy operation in a try block. Some files can't be copied. 
         try {
           destFile = sourceFile.makeCopy(driveTree[i].name, DriveApp.getFolderById(parentFolder));
           driveTree[i].destId = destFile.getId();
+          cloneJob.fileCount++;
         }
-        catch(error) {
+        catch (error) {
           Logger.log("Failed copying file " + driveTree[i].name + " " + error);
           driveTree[i].destId = "FAILED";
+          cloneJob.failures++;
+          cloneJob.failureList.push({ "name": sourceFile.getName(), "id": sourceFile.getId(), "message": error });
         }
       }
       else {
-        Logger.log("File already copied. Skipping " + driveTree[i].name);
       }
     }
     if (driveTree[i].children) {
-      cloneDir_(driveTree[i].children, driveTree[i].destId)
+      copyDir_(driveTree[i].children, driveTree[i].destId)
     }
   }
 }
@@ -208,22 +212,4 @@ function getViewerEmails_(folder) {
   }
   return rv;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
