@@ -15,6 +15,7 @@ Setup:
   2. Modify sourceFolderId to be the folder ID of the source folder. 
     Note: You can use DriveApp.getRootFolder().getId() if you want to copy an entire drive. 
   3. Optional - set "skipPhase" to true for any job phases you want to skip. Sharing and star settings are good options for skippage if you don't need them. They can be very slow. 
+  4. Optional - set "moveFiles" to true if you want to move files to their destination. Copying files can break links in spreadsheets and forms, so moving may be more desireable.
 Usage: 
 1. Run driveClone
     If the script runs longer than maxRuntime it creates a trigger to rerun the script after msToNextRun milliseconds. It keeps doing this until the job is completed. 
@@ -23,8 +24,9 @@ Usage:
 
 //ID of the Source folder
 const sourceFolderId = "SOURCEFOLDERID";
+//const sourceFolderId = DriveApp.getRootFolder().getId();
 //ID of the destination folder. 
-const targetParentFolderId = 'PARENTFOLDERID';
+const targetParentFolderId = '1dZY1c9SD-6XOPuQh81aCe3cNa5zJj3Xs';
 //The temporary state filename - it will be written to the root of the source folder. 
 const statefileFilename = 'driveClone.json';
 //Official max runtime is 6 minutes for unpaid and 30 min for paid accounts. Some processes aren't easy to break out of. 
@@ -34,6 +36,8 @@ const maxRuntime = 300 * 1000;
 const msToNextRun = 30000;
 //This is the global object that's going to hold all details about the clone job. 
 let cloneJob;
+//Set to true if you want to MOVE files to the destination. 
+let moveFiles = false;
 
 //Job is divided into phases. Phase 0 is the only one that can't restart if it runs out of time. 
 //Testing indicates that you should be able to traverse a thousand nested folders in 5 min. 
@@ -63,11 +67,17 @@ function driveClone() {
     { logMessage: "Phase 2 - Folder Sharing", callbackFunction: setFolderSharing_, travObject: true , skipPhase: false},
     { logMessage: "Phase 3 - Folder Stars", callbackFunction: setFolderStars_, travObject: true , skipPhase: false},
     { logMessage: "Phase 4 - Build File List", callbackFunction: findFiles_, travObject: true , skipPhase: false},
-    { logMessage: "Phase 5 - File Copy", callbackFunction: copyFiles_, travObject: true , skipPhase: false},
+    { logMessage: "Phase 5 - File Copy/Move", callbackFunction: copyFiles_, travObject: true , skipPhase: false},
     { logMessage: "Phase 6 - File Sharing", callbackFunction: setFileSharing_, travObject: true , skipPhase: false},
     { logMessage: "Phase 7 - File Stars", callbackFunction: setFileStars_, travObject: true , skipPhase: false},
     { logMessage: "Phase 8 - Cleanup", callbackFunction: cloneJobFinish_, travObject: false , skipPhase: false},
   ];
+
+//If we're moving files we can skip the file sharing and file stars. 
+  if(moveFiles){
+    jobPhases[6].skipPhase=true;
+    jobPhases[7].skipPhase = true;
+  }
 
   for (let currentPhase = cloneJob.phase; currentPhase < jobPhases.length; currentPhase++) {
     Logger.log(jobPhases[currentPhase].logMessage);
@@ -307,13 +317,20 @@ function copyFiles_(folder) {
       if (file.destId) {
         continue;
       }
-      Logger.log("Copying file " + file.name);
+      Logger.log("Copying/Moving file " + file.name);
       let driveSourceFile = DriveApp.getFileById(file.id);
       let driveDestFolder = DriveApp.getFolderById(folder.destId);
       try {
-        driveDestFile = driveSourceFile.makeCopy(file.name, driveDestFolder);
-        file.destId = driveDestFile.getId();
-        cloneJob.fileCount++;
+        if (moveFiles) {
+          driveSourceFile.moveTo(driveDestFolder);
+          file.destId = file.id;
+          cloneJob.fileCount++;
+        }
+        else {
+          driveDestFile = driveSourceFile.makeCopy(file.name, driveDestFolder);
+          cloneJob.fileCount++;
+          file.destId = driveDestFile.getId();
+        }
       }
       catch (error) {
         Logger.log("Failed copying file " + file.name + " " + error);
