@@ -26,18 +26,31 @@ Usage:
 const sourceFolderId = "SOURCEFOLDERID";
 //const sourceFolderId = DriveApp.getRootFolder().getId();
 //ID of the destination folder. 
-const targetParentFolderId = '1dZY1c9SD-6XOPuQh81aCe3cNa5zJj3Xs';
+const targetParentFolderId = 'DESTINATIONFOLDERID';
 //The temporary state filename - it will be written to the root of the source folder. 
 const statefileFilename = 'driveClone.json';
 //Official max runtime is 6 minutes for unpaid and 30 min for paid accounts. Some processes aren't easy to break out of. 
 //Go with 5 min here to be safe. 
-const maxRuntime = 300 * 1000;
+const maxRuntime = 5 * 60 * 1000;
 //How long to wait to trigger another run of runCloneJob. 30 seconds seems fair. 
 const msToNextRun = 30000;
 //This is the global object that's going to hold all details about the clone job. 
 let cloneJob;
 //Set to true if you want to MOVE files to the destination. 
 let moveFiles = false;
+
+//Set this to true if you don't want to send email notifications (requires Advanced Drive Service enabled)
+let suppressEmailNotifications = true;
+
+//Shall we ensure that original owner do have some permissions? (Only for suppressEmailNotifications = true)
+//  Possible values: reader, commenter, writer, null. Script will explicitly give this permission to the owner unless null.
+let ensureOwnerPermission = null;
+
+//----------------------------------------------\\
+if (!Drive && suppressEmailNotifications) {
+  throw "Advanced Drive API is probably not available. See https://developers.google.com/apps-script/guides/services/advanced?authuser=0#enable_advanced_services";
+}
+//----------------------------------------------\\
 
 //Job is divided into phases. Phase 0 is the only one that can't restart if it runs out of time. 
 //Testing indicates that you should be able to traverse a thousand nested folders in 5 min. 
@@ -127,7 +140,8 @@ function cloneJobSetup_() {
     folders: [],
     files: [],
     editors: [],
-    viewers: []
+    viewers: [],
+    path: "/"
   };
   cloneJob.tree.push(root);
   traverseDrive_(cloneJob.tree);
@@ -136,11 +150,13 @@ function cloneJobSetup_() {
 function cloneJobFinish_() {
   cloneJob.end = Date.now();
   cloneJob.totalRuntime = (cloneJob.end - cloneJob.start) / 60000
-  MailApp.sendEmail(Session.getActiveUser().getEmail(), "Drive clone complete", "Your drive clone job has completed successfully\n\n" +
+  summaryString = "Your drive clone job has completed successfully\n\n" +
     "\nFolders copied: " + cloneJob.folderCount +
     "\nFiles copied: " + cloneJob.fileCount +
     "\nFailures: " + cloneJob.failures +
-    "\nTotal Runtime: " + Math.round(cloneJob.totalRuntime) + " Minutes\n");
+    "\nTotal Runtime: " + Math.round(cloneJob.totalRuntime) + " Minutes\n";
+  Logger.log(summaryString)
+  MailApp.sendEmail(Session.getActiveUser().getEmail(), "Drive clone complete", summaryString);
 }
 //----------------------------------------------\\
 function traverseDrive_(driveTree) {
@@ -153,8 +169,9 @@ function traverseDrive_(driveTree) {
     let driveSubFolders = driveFolder.getFolders();
     while (driveSubFolders.hasNext()) {
       let driveSubFolder = driveSubFolders.next();
+      let subfolderName = driveSubFolder.getName();
       let newSubFolder = {
-        name: driveSubFolder.getName(),
+        name: subfolderName,
         id: driveSubFolder.getId(),
         parentId: null,
         phase: 0,
@@ -163,7 +180,8 @@ function traverseDrive_(driveTree) {
         folders: [],
         files: [],
         editors: [],
-        viewers: []
+        viewers: [],
+        path: currentFolder.path + subfolderName + '/'
       };
       currentFolder.folders.push(newSubFolder);
     }
@@ -200,21 +218,54 @@ function createFolders_(folder) {
   }
 }
 //----------------------------------------------\\
+function copyPermissions_(file) {
+  // Works for both files and folders.
+  // Requires Advanced Drive Service.
+  Logger.log("Getting permissions for %s", file.path);
+  let filePermissionsList = Drive.Permissions.list(file.id, {fields: "permissions(id,type,emailAddress,role)"}).permissions;
+  Logger.log("Creating permissions for its copy, %s", file.destId);
+
+  for (permission of filePermissionsList) {
+    let newRole = permission.role
+    if ( permission.role == "owner" ) {
+      // do not add former owner's permission if ensureOwnerPermission is null
+      if (ensureOwnerPermission === null ) continue;
+      // else
+      newRole = ensureOwnerPermission;
+    }
+    Drive.Permissions.create(
+      {
+        type: permission.type,
+        emailAddress: permission.emailAddress,
+        role: newRole
+      }, 
+      file.destId, 
+      {
+        sendNotificationEmail: false
+      }
+    ) 
+  }
+}
+//----------------------------------------------\\
 function setFolderSharing_(folder) {
   if (folder.phase < cloneJob.phase && !isTimedOut_()) {
-    let driveSourceFolder = DriveApp.getFolderById(folder.id);
-    let driveDestFolder = DriveApp.getFolderById(folder.destId);
-    let editors = getUserEmails_(driveSourceFolder, "editors");
-    if (editors && editors.length > 0) {
-      Logger.log("Adding editors for " + folder.name);
-      driveDestFolder.addEditors(editors);
-      folder.editors = editors;
-    }
-    let viewers = getUserEmails_(driveSourceFolder, "viewers");
-    if (viewers && viewers.length > 0) {
-      Logger.log("Adding viewers for " + folder.name);
-      driveDestFolder.addViewers(viewers);
-      folder.viewers = viewers;
+    if (suppressEmailNotifications) {
+      copyPermissions_(folder);
+    } else {
+      let driveSourceFolder = DriveApp.getFolderById(folder.id);
+      let driveDestFolder = DriveApp.getFolderById(folder.destId);
+      let editors = getUserEmails_(driveSourceFolder, "editors");
+      if (editors && editors.length > 0) {
+        Logger.log("Adding editors for " + folder.name);
+        driveDestFolder.addEditors(editors);
+        folder.editors = editors;
+      }
+      let viewers = getUserEmails_(driveSourceFolder, "viewers");
+      if (viewers && viewers.length > 0) {
+        Logger.log("Adding viewers for " + folder.name);
+        driveDestFolder.addViewers(viewers);
+        folder.viewers = viewers;
+      }
     }
   }
   folder.phase = 2;
@@ -222,23 +273,28 @@ function setFolderSharing_(folder) {
 //----------------------------------------------\\
 function setFileSharing_(folder) {
   if (folder.phase < cloneJob.phase) {
+    Logger.log("Sharing files in %s", folder.path)
     for (let file of folder.files) {
       if (isTimedOut_()) {
         return;
       }
-      let driveDestFile = DriveApp.getFileById(file.destId);
-      let driveSourceFile = DriveApp.getFileById(file.id);
-      let editors = getUserEmails_(driveSourceFile, "editors");
-      if (editors && editors.length > 0) {
-        Logger.log("Adding editors for " + file.name);
-        driveDestFile.addEditors(editors);
-        file.editors = editors;
-      }
-      let viewers = getUserEmails_(driveSourceFile, "viewers");
-      if (viewers && viewers.length > 0) {
-        Logger.log("Adding viewers for " + file.name);
-        driveDestFile.addViewers(viewers);
-        file.viewers = viewers;
+      if (suppressEmailNotifications) {
+        copyPermissions_(file)
+      } else {
+        let driveDestFile = DriveApp.getFileById(file.destId);
+        let driveSourceFile = DriveApp.getFileById(file.id);
+        let editors = getUserEmails_(driveSourceFile, "editors");
+        if (editors && editors.length > 0) {
+          Logger.log("Adding editors for " + file.name);
+          driveDestFile.addEditors(editors);
+          file.editors = editors;
+        }
+        let viewers = getUserEmails_(driveSourceFile, "viewers");
+        if (viewers && viewers.length > 0) {
+          Logger.log("Adding viewers for " + file.name);
+          driveDestFile.addViewers(viewers);
+          file.viewers = viewers;
+        }
       }
     }
   }
@@ -291,14 +347,16 @@ function findFiles_(folder) {
       if (nextDriveFileName == statefileFilename && folder.id == sourceFolderId) {
         continue;
       }
+      let filename = nextDriveFile.getName();
       let newFile = {
-        name: nextDriveFile.getName(),
+        name: filename,
         id: nextDriveFile.getId(),
         destId: null,
         isStarred: false,
         editors: [],
         viewers: [],
-        size: nextDriveFile.getSize()
+        size: nextDriveFile.getSize(),
+        path: folder.path + filename
       }
       folder.files.push(newFile);
       Logger.log("Found file " + newFile.name);
@@ -309,6 +367,7 @@ function findFiles_(folder) {
 //----------------------------------------------\\
 function copyFiles_(folder) {
   if (folder.phase < cloneJob.phase) {
+    Logger.log("Copying/Moving files in %s", folder.path)
     for (let file of folder.files) {
       if (isTimedOut_()) {
         return;
@@ -362,11 +421,16 @@ function readStateFile_() {
   let destFolder = DriveApp.getFolderById(sourceFolderId);
   let fileList = destFolder.getFilesByName(statefileFilename);
   let rv = null;
-  if (fileList.hasNext()) {
+  let statefileExists = false;
+  while (fileList.hasNext()) {
     var file = fileList.next();
-    rv = JSON.parse(file.getBlob().getDataAsString());
+    if (!file.isTrashed()) {
+      rv = JSON.parse(file.getBlob().getDataAsString());
+      statefileExists = true;
+      break;
+    }
   }
-  else {
+  if (!statefileExists) {
     rv = {
       start: Date.now(),
       timeout: Date.now() + maxRuntime,
@@ -412,5 +476,16 @@ function isTimedOut_() {
   }
   else {
     return false;
+  }
+}
+//----------------------------------------------\\
+function deleteStateFile() {
+  let destFolder = DriveApp.getFolderById(sourceFolderId);
+  let fileList = destFolder.getFilesByName(statefileFilename);
+  while (fileList.hasNext()) {
+    // State file exists - delete it
+    var file = fileList.next();
+    file.setTrashed(true);
+    Logger.log('Trashing %s / %s', destFolder.getName(), statefileFilename )
   }
 }
